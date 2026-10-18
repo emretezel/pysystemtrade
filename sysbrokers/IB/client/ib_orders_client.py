@@ -186,6 +186,14 @@ class ibOrdersClient(ibContractsClient):
         if account_id is not arg_not_supplied:
             ib_order.account = account_id
 
+        # Always send an explicit time-in-force. IB Gateway 10.45+ otherwise fills
+        # it in from the order preset and emits informational message 10349
+        # ("Order TIF was set to DAY based on order preset"). ib_insync 0.9.x treats
+        # any unknown code as an error and transiently marks the trade Cancelled,
+        # so the algos abandoned live orders and the stack handler resubmitted them
+        # (2026-10-13 JPY_mini incident). DAY is what the preset applied anyway.
+        ib_order.tif = "DAY"
+
         return ib_order
 
     def ib_cancel_order(self, original_order_object: ibOrder):
