@@ -473,6 +473,16 @@ class dataBroker(productionDataLayerGeneric):
 
         return result
 
+    def confirm_order_is_finished_cancelling_if_required(
+        self, broker_order_with_controls: orderWithControls
+    ) -> bool:
+        ## True only if the broker has confirmed the order is filled or cancelled
+        result = self.broker_execution_stack_data.confirm_order_is_finished_cancelling_if_required(
+            broker_order_with_controls
+        )
+
+        return result
+
     def modify_limit_price_given_control_object(
         self, broker_order_with_controls: orderWithControls, new_limit_price: float
     ) -> orderWithControls:

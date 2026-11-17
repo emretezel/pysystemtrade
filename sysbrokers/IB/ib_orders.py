@@ -2,7 +2,9 @@ from ib_insync import Trade as ibTrade
 
 from copy import copy
 
+import asyncio
 import datetime
+import time
 
 from sysbrokers.IB.ib_futures_contracts_data import ibFuturesContractData
 from sysbrokers.IB.ib_instruments_data import ibFuturesInstrumentData
@@ -416,6 +418,25 @@ class ibExecutionStackData(brokerExecutionStackData):
 
         return cancellation_status
 
+    def confirm_order_is_finished_cancelling_if_required(
+        self,
+        broker_order_with_controls: ibOrderWithControls,
+    ) -> bool:
+        """
+        True only if IB has confirmed this order is finished (filled or cancelled).
+        If it has not, the order is cancelled and we wait a bounded time for confirmation.
+
+        Must be called before a contract order is released for another broker order.
+        The status checked by check_order_is_cancelled_given_control_object() is not enough:
+        see trade_is_finished_according_to_broker()
+        """
+        trade = broker_order_with_controls.control_object.trade
+        log = broker_order_with_controls.order.log_with_attributes(self.log)
+
+        return confirm_trade_is_finished_cancelling_if_required(
+            ib_client=self.ib_client, trade=trade, log=log
+        )
+
     def _get_status_for_trade_object(self, original_trade_object: ibTrade) -> str:
         self.ib_client.refresh()
         return original_trade_object.orderStatus.status
@@ -475,6 +496,143 @@ class ibExecutionStackData(brokerExecutionStackData):
         status = self._get_status_for_trade_object(original_trade_object)
 
         return status
+
+
+# How long to wait for IB to confirm an order is finished before giving up
+# The stack handler does nothing else whilst it waits
+CONFIRM_FINISHED_WAIT_SECONDS = 30.0
+CONFIRM_FINISHED_POLL_SECONDS = 1.0
+CONFIRM_FINISHED_SECOND_LOOK_SECONDS = 0.5
+RESEND_CANCEL_AFTER_SECONDS = 10.0
+# One reply from IB that does not list an order is not proof it has gone
+REPLIES_NOT_LISTING_ORDER_REQUIRED = 2
+
+IB_CANCELLED_STATUSES = ("Cancelled", "ApiCancelled")
+IB_DONE_STATUSES = ("Filled",) + IB_CANCELLED_STATUSES
+
+
+def trade_is_finished_according_to_broker(trade: ibTrade) -> bool:
+    """
+    True only if IB itself has told us this order is finished (filled or cancelled)
+
+    ib_insync 0.9.86 sets a trade's status to Cancelled whenever an error message arrives
+    carrying its order id (wrapper.error). That includes IB rejecting a *change* to an
+    order that is still working, eg 'Error 201 Order rejected - reason:Invalid Price'
+    when a limit price is modified. So a status of Cancelled is not, on its own,
+    evidence that the order is dead.
+
+    We tell the two apart using the trade log: a cancel reported by IB in an order status
+    message is logged with errorCode 0, one inferred from an error message is not.
+    """
+    order_status = trade.orderStatus
+    status = order_status.status
+
+    if status == "Filled":
+        # only ever set by an order status message from IB
+        return True
+
+    if order_status.filled > 0 and order_status.remaining == 0:
+        # also only set by IB; fills can arrive just before the Filled status does
+        return True
+
+    if status in IB_CANCELLED_STATUSES:
+        return _cancelled_status_was_reported_by_broker(trade)
+
+    return False
+
+
+def _cancelled_status_was_reported_by_broker(trade: ibTrade) -> bool:
+    for log_entry in reversed(trade.log):
+        if log_entry.status in IB_CANCELLED_STATUSES:
+            return log_entry.errorCode == 0
+
+    # nothing in the log to say where the cancelled status came from
+    return False
+
+
+def confirm_trade_is_finished_cancelling_if_required(
+    ib_client: ibOrdersClient,
+    trade: ibTrade,
+    log,
+    wait_time_seconds: float = CONFIRM_FINISHED_WAIT_SECONDS,
+    poll_seconds: float = CONFIRM_FINISHED_POLL_SECONDS,
+    second_look_seconds: float = CONFIRM_FINISHED_SECOND_LOOK_SECONDS,
+) -> bool:
+    """
+    Make sure an order is finished at IB before anything else is done with its parent
+
+    - If IB has already told us it is filled or cancelled: True, nothing sent to IB
+    - Otherwise cancel it, then wait until IB confirms the cancel (or a fill),
+       or until IB has twice running not listed it as open and we also hold it as done
+    - If we can't get that confirmation in time: False
+
+    Not hearing from IB always counts as 'not finished'
+    """
+    ib_client.refresh()
+    if trade_is_finished_according_to_broker(trade):
+        return True
+
+    # A status message may already be on its way; give it a moment to arrive
+    ib_client.ib.sleep(second_look_seconds)
+    if trade_is_finished_according_to_broker(trade):
+        return True
+
+    log.warning(
+        "IB has not confirmed that order id %s (permid %s) is finished, status here is '%s': cancelling it and waiting for confirmation"
+        % (
+            str(trade.order.orderId),
+            str(trade.order.permId),
+            str(trade.orderStatus.status),
+        )
+    )
+
+    _send_cancel_without_raising(ib_client=ib_client, trade=trade, log=log)
+    time_cancel_sent = time.monotonic()
+    deadline = time_cancel_sent + wait_time_seconds
+    replies_not_listing_order = 0
+
+    while time.monotonic() < deadline:
+        ib_client.ib.sleep(poll_seconds)
+
+        if trade_is_finished_according_to_broker(trade):
+            # IB has now told us directly
+            return True
+
+        try:
+            listed_as_open = ib_client.ib_is_trade_listed_as_open(trade)
+        except (Exception, asyncio.CancelledError):
+            # No answer, or couldn't ask. We know nothing, so assume it is still open
+            replies_not_listing_order = 0
+            continue
+
+        if listed_as_open:
+            replies_not_listing_order = 0
+            seconds_since_cancel_sent = time.monotonic() - time_cancel_sent
+            if seconds_since_cancel_sent >= RESEND_CANCEL_AFTER_SECONDS:
+                _send_cancel_without_raising(ib_client=ib_client, trade=trade, log=log)
+                time_cancel_sent = time.monotonic()
+            continue
+
+        if trade.orderStatus.status not in IB_DONE_STATUSES:
+            # IB doesn't list it, but we still hold it as working: don't trust the reply
+            replies_not_listing_order = 0
+            continue
+
+        replies_not_listing_order = replies_not_listing_order + 1
+        if replies_not_listing_order >= REPLIES_NOT_LISTING_ORDER_REQUIRED:
+            return True
+
+    return False
+
+
+def _send_cancel_without_raising(ib_client: ibOrdersClient, trade: ibTrade, log):
+    try:
+        # this is sent to IB even if ib_insync thinks the order is already done
+        ib_client.ib_cancel_order(trade.order)
+    except (Exception, asyncio.CancelledError) as e:
+        log.warning(
+            "Couldn't send cancel for order id %s: %s" % (str(trade.order.orderId), str(e))
+        )
 
 
 def add_trade_info_to_broker_order(

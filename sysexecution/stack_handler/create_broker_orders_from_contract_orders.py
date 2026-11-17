@@ -1,3 +1,4 @@
+import asyncio
 from copy import copy
 from syscore.objects import (
     resolve_function,
@@ -329,6 +330,16 @@ class stackHandlerCreateBrokerOrders(stackHandlerForFills):
         self, completed_broker_order_with_controls: orderWithControls
     ):
 
+        # Before anything else, make sure the order really is finished at the broker.
+        # Once the contract order is released another broker order can be created for it,
+        # so if this one is still working we would end up with two (or more) live orders.
+        # An algo can believe an order is cancelled when it is not: see
+        # ibExecutionStackData.confirm_order_is_finished_cancelling_if_required
+        broker_order_is_finished = self.confirm_broker_order_is_finished(
+            completed_broker_order_with_controls
+        )
+
+        # Read the order only now, the step above refreshes it with any late fills
         broker_order = completed_broker_order_with_controls.order
 
         # update trade limits
@@ -339,12 +350,66 @@ class stackHandlerCreateBrokerOrders(stackHandlerForFills):
             broker_order_id=broker_order.order_id, broker_order=broker_order
         )
 
-        # release contract order from algo
         contract_order_id = broker_order.parent
+
+        if not broker_order_is_finished:
+            # Leave the contract order under algo control: no more broker orders
+            #   will be created for it until an operator has had a look
+            # Called once per broker order, so this is one email
+            log = broker_order.log_with_attributes(self.log)
+            log.critical(
+                "Could not confirm broker order %s (id %s) is finished at the broker: contract order %s NOT released, no more orders will be sent for it. Check open orders at the broker, then use interactive_order_stack option 35 to release"
+                % (str(broker_order), str(broker_order.order_id), str(contract_order_id))
+            )
+            return None
+
+        if self.is_contract_order_flagged_as_overfilled(contract_order_id):
+            # Already reported, see handle_overfilled_contract_order
+            # Releasing it would allow the part we think is unfilled to be traded again
+            self.log.warning(
+                "Contract order %s has been overfilled: not releasing from algo control"
+                % str(contract_order_id)
+            )
+            return None
+
+        # release contract order from algo
         self.contract_stack.release_order_from_algo_control(contract_order_id)
         self.log.debug(
             "Released contract order %s from algo control" % contract_order_id
         )
+
+    def confirm_broker_order_is_finished(
+        self, broker_order_with_controls: orderWithControls
+    ) -> bool:
+        """
+        True only if the broker has confirmed the order is filled or cancelled.
+        The order will be cancelled if it is found to be still working.
+
+        Never raises: if we can't find out, the answer is False
+        """
+        try:
+            is_finished = (
+                self.data_broker.confirm_order_is_finished_cancelling_if_required(
+                    broker_order_with_controls
+                )
+            )
+        except (Exception, asyncio.CancelledError) as e:
+            self.log.warning(
+                "Problem confirming with broker that order is finished, assuming it is not: %s"
+                % str(e)
+            )
+            is_finished = False
+
+        try:
+            # pick up any fill or change of status that arrived whilst we were checking
+            broker_order_with_controls.update_order()
+        except (Exception, asyncio.CancelledError) as e:
+            self.log.warning(
+                "Problem refreshing broker order after confirming it was finished: %s"
+                % str(e)
+            )
+
+        return is_finished is True
 
     def add_trade_to_trade_limits(self, executed_order: brokerOrder):
 

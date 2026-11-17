@@ -33,6 +33,37 @@ from sysobjects.contracts import futuresContract
 
 # we don't include ibClient since we get that through contracts client
 
+# How long to wait for IB to tell us which orders are open. Must be more than zero:
+# zero or None would mean 'wait for ever', and nothing sets ib.RequestTimeout
+OPEN_ORDERS_QUERY_TIMEOUT_SECONDS = 5.0
+
+
+def is_same_ib_order(candidate: ibTrade, target: ibTrade) -> bool:
+    """
+    Do these two ib_insync trades refer to the same order at IB?
+
+    Never matches on an id that is zero (not yet assigned)
+    """
+    if candidate is target:
+        return True
+
+    candidate_order = candidate.order
+    target_order = target.order
+
+    if candidate_order.orderId and target_order.orderId:
+        same_client_and_order_id = (
+            candidate_order.orderId == target_order.orderId
+            and candidate_order.clientId == target_order.clientId
+        )
+        if same_client_and_order_id:
+            return True
+
+    if candidate_order.permId and target_order.permId:
+        if candidate_order.permId == target_order.permId:
+            return True
+
+    return False
+
 
 class ibOrdersClient(ibContractsClient):
     def broker_get_orders(
@@ -200,6 +231,31 @@ class ibOrdersClient(ibContractsClient):
         new_trade_object = self.ib.cancelOrder(original_order_object)
 
         return new_trade_object
+
+    def ib_is_trade_listed_as_open(
+        self,
+        trade_object: ibTrade,
+        timeout_seconds: float = OPEN_ORDERS_QUERY_TIMEOUT_SECONDS,
+    ) -> bool:
+        """
+        Ask IB which orders are open, and say if this one is amongst them.
+
+        The request is bounded. Raises asyncio.TimeoutError if IB does not answer in time,
+        and may raise other exceptions (including asyncio.CancelledError) if disconnected.
+
+        A single answer of False is NOT proof the order is dead: a reply can be incomplete,
+        or not yet include a very new order. Callers must not rely on one reply alone.
+        """
+        assert timeout_seconds > 0, "Timeout must be positive or we could wait for ever"
+
+        list_of_open_trades = self.ib.run(
+            self.ib.reqAllOpenOrdersAsync(), timeout=timeout_seconds
+        )
+
+        return any(
+            is_same_ib_order(open_trade, trade_object)
+            for open_trade in list_of_open_trades
+        )
 
     def modify_limit_price_given_original_objects(
         self,

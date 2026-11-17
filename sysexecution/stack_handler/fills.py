@@ -12,13 +12,19 @@ from sysexecution.stack_handler.completed_orders import stackHandlerForCompletio
 
 from sysproduction.data.broker import dataBroker
 
+from sysexecution.orders.base_orders import overFilledOrder
 from sysexecution.orders.contract_orders import contractOrder
 from sysexecution.orders.instrument_orders import instrumentOrder
 from sysexecution.orders.broker_orders import brokerOrder
 from sysexecution.orders.list_of_orders import listOfOrders
 from sysexecution.trade_qty import tradeQuantity
 
+from sysproduction.data.controls import dataLocks
 from sysproduction.data.positions import updatePositions
+
+# Put on a contract order whose broker orders have filled more than it wanted,
+#   so that no more broker orders are created for it
+OVERFILLED_CONTROLLING_ALGO_REF = "OVERFILLED_needs_operator"
 
 
 class stackHandlerForFills(stackHandlerForCompletions):
@@ -126,12 +132,80 @@ class stackHandlerForFills(stackHandlerForCompletions):
         total_filled_qty = broker_order_list.total_filled_qty()
         average_fill_price = broker_order_list.average_fill_price()
 
-        self.apply_fills_to_contract_order(
-            contract_order_before_fill=contract_order_before_fill,
-            filled_price=average_fill_price,
-            filled_qty=total_filled_qty,
-            fill_datetime=final_fill_datetime,
+        try:
+            self.apply_fills_to_contract_order(
+                contract_order_before_fill=contract_order_before_fill,
+                filled_price=average_fill_price,
+                filled_qty=total_filled_qty,
+                fill_datetime=final_fill_datetime,
+            )
+        except overFilledOrder:
+            # The broker orders have filled more than the contract order wanted.
+            # This used to propagate and kill the whole stack handler (2026-11-17)
+            self.handle_overfilled_contract_order(
+                contract_order=contract_order_before_fill,
+                total_filled_qty=total_filled_qty,
+            )
+
+    def handle_overfilled_contract_order(
+        self, contract_order: contractOrder, total_filled_qty: tradeQuantity
+    ):
+        """
+        Broker orders have filled more than their parent contract order wanted
+
+        We don't apply the fill, so the contract order and stored positions are left as they
+        were and there will be a break against the broker. We stop any more trading in the
+        instrument, and tell the operator once: this is called on every pass of the fills
+        sweep and every critical message is emailed.
+        """
+        contract_order_id = contract_order.order_id
+        already_reported = self._overfilled_contract_order_ids
+        if contract_order_id in already_reported:
+            return None
+        already_reported.add(contract_order_id)
+
+        instrument_code = contract_order.instrument_code
+        log = contract_order.log_with_attributes(self.log)
+
+        try:
+            data_locks = dataLocks(self.data)
+            if not data_locks.is_instrument_locked(instrument_code):
+                data_locks.add_lock_for_instrument(instrument_code)
+        except Exception as e:
+            log.warning(
+                "Couldn't lock %s after overfill: %s" % (instrument_code, str(e))
+            )
+
+        try:
+            self.contract_stack.add_controlling_algo_ref(
+                contract_order_id, OVERFILLED_CONTROLLING_ALGO_REF
+            )
+        except Exception:
+            # Normal if an algo is still in control of the order: either way
+            #   no further broker orders will be created for it
+            pass
+
+        log.critical(
+            "Broker orders have filled %s which is more than contract order %s (id %s) wanted: fill NOT applied, positions NOT updated, instrument %s locked. Expect a position break; compare with the broker and correct with balance trades"
+            % (
+                str(total_filled_qty),
+                str(contract_order),
+                str(contract_order_id),
+                instrument_code,
+            )
         )
+
+    def is_contract_order_flagged_as_overfilled(self, contract_order_id: int) -> bool:
+        return contract_order_id in self._overfilled_contract_order_ids
+
+    @property
+    def _overfilled_contract_order_ids(self) -> set:
+        # In memory only: lasts as long as this stack handler
+        store = getattr(self, "_overfilled_contract_order_ids_store", None)
+        if store is None:
+            store = self._overfilled_contract_order_ids_store = set()
+
+        return store
 
     def apply_contract_order_fill_to_database(self, contract_order: contractOrder):
         contract_order_before_fill = self.contract_stack.get_order_with_id_from_stack(
