@@ -169,21 +169,32 @@ class stackHandlerForFills(stackHandlerForCompletions):
 
         try:
             data_locks = dataLocks(self.data)
-            if not data_locks.is_instrument_locked(instrument_code):
+            if data_locks.is_instrument_locked(instrument_code):
+                log.debug("%s was already locked when overfill found" % instrument_code)
+            else:
                 data_locks.add_lock_for_instrument(instrument_code)
+                log.debug("Locked %s because of overfill" % instrument_code)
         except Exception as e:
             log.warning(
-                "Couldn't lock %s after overfill: %s" % (instrument_code, str(e))
+                "Couldn't lock %s after overfill: %s %s"
+                % (instrument_code, type(e).__name__, str(e))
             )
 
         try:
             self.contract_stack.add_controlling_algo_ref(
                 contract_order_id, OVERFILLED_CONTROLLING_ALGO_REF
             )
-        except Exception:
+            log.debug(
+                "Contract order %s put under algo control '%s' so no more broker orders are created for it"
+                % (str(contract_order_id), OVERFILLED_CONTROLLING_ALGO_REF)
+            )
+        except Exception as e:
             # Normal if an algo is still in control of the order: either way
             #   no further broker orders will be created for it
-            pass
+            log.debug(
+                "Contract order %s not put under algo control '%s', normal if an algo already controls it: %s"
+                % (str(contract_order_id), OVERFILLED_CONTROLLING_ALGO_REF, str(e))
+            )
 
         log.critical(
             "Broker orders have filled %s which is more than contract order %s (id %s) wanted: fill NOT applied, positions NOT updated, instrument %s locked. Expect a position break; compare with the broker and correct with balance trades"

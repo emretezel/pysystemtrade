@@ -570,11 +570,16 @@ def confirm_trade_is_finished_cancelling_if_required(
     """
     ib_client.refresh()
     if trade_is_finished_according_to_broker(trade):
+        log.debug("IB confirms order is finished: %s" % describe_ib_trade(trade))
         return True
 
     # A status message may already be on its way; give it a moment to arrive
     ib_client.ib.sleep(second_look_seconds)
     if trade_is_finished_according_to_broker(trade):
+        log.debug(
+            "IB confirms order is finished (after waiting %s seconds for its status): %s"
+            % (str(second_look_seconds), describe_ib_trade(trade))
+        )
         return True
 
     log.warning(
@@ -585,28 +590,50 @@ def confirm_trade_is_finished_cancelling_if_required(
             str(trade.orderStatus.status),
         )
     )
+    # Why we don't believe it is finished: everything IB / ib_insync has said about it
+    log.debug(
+        "IB status history for order id %s (times UTC): %s"
+        % (str(trade.order.orderId), describe_ib_trade_history(trade))
+    )
 
     _send_cancel_without_raising(ib_client=ib_client, trade=trade, log=log)
-    time_cancel_sent = time.monotonic()
-    deadline = time_cancel_sent + wait_time_seconds
+    time_started = time.monotonic()
+    time_cancel_sent = time_started
+    deadline = time_started + wait_time_seconds
     replies_not_listing_order = 0
+    what_ib_last_said = "nothing yet"
 
     while time.monotonic() < deadline:
         ib_client.ib.sleep(poll_seconds)
 
         if trade_is_finished_according_to_broker(trade):
             # IB has now told us directly
+            log.debug(
+                "Order confirmed finished by a status message from IB, %.1f seconds after cancel: %s"
+                % (time.monotonic() - time_started, describe_ib_trade(trade))
+            )
             return True
 
         try:
             listed_as_open = ib_client.ib_is_trade_listed_as_open(trade)
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError) as e:
             # No answer, or couldn't ask. We know nothing, so assume it is still open
             replies_not_listing_order = 0
+            what_ib_last_said = "no answer to open orders request (%s %s)" % (
+                type(e).__name__,
+                str(e),
+            )
+            _log_waiting_for_order_to_finish(
+                log, trade, what_ib_last_said, time_started
+            )
             continue
 
         if listed_as_open:
             replies_not_listing_order = 0
+            what_ib_last_said = "IB lists the order as open"
+            _log_waiting_for_order_to_finish(
+                log, trade, what_ib_last_said, time_started
+            )
             seconds_since_cancel_sent = time.monotonic() - time_cancel_sent
             if seconds_since_cancel_sent >= RESEND_CANCEL_AFTER_SECONDS:
                 _send_cancel_without_raising(ib_client=ib_client, trade=trade, log=log)
@@ -616,11 +643,37 @@ def confirm_trade_is_finished_cancelling_if_required(
         if trade.orderStatus.status not in IB_DONE_STATUSES:
             # IB doesn't list it, but we still hold it as working: don't trust the reply
             replies_not_listing_order = 0
+            what_ib_last_said = (
+                "IB does not list the order as open, but its status here is not a finished one so the reply is not trusted"
+            )
+            _log_waiting_for_order_to_finish(
+                log, trade, what_ib_last_said, time_started
+            )
             continue
 
         replies_not_listing_order = replies_not_listing_order + 1
+        what_ib_last_said = (
+            "IB does not list the order as open (%d replies running, %d needed)"
+            % (replies_not_listing_order, REPLIES_NOT_LISTING_ORDER_REQUIRED)
+        )
+        _log_waiting_for_order_to_finish(log, trade, what_ib_last_said, time_started)
+
         if replies_not_listing_order >= REPLIES_NOT_LISTING_ORDER_REQUIRED:
+            log.debug(
+                "Order confirmed finished %.1f seconds after cancel, IB no longer lists it as open: %s"
+                % (time.monotonic() - time_started, describe_ib_trade(trade))
+            )
             return True
+
+    log.warning(
+        "Order NOT confirmed finished %.1f seconds after cancel. Last heard: %s. Now: %s. IB status history (times UTC): %s"
+        % (
+            time.monotonic() - time_started,
+            what_ib_last_said,
+            describe_ib_trade(trade),
+            describe_ib_trade_history(trade),
+        )
+    )
 
     return False
 
@@ -629,10 +682,89 @@ def _send_cancel_without_raising(ib_client: ibOrdersClient, trade: ibTrade, log)
     try:
         # this is sent to IB even if ib_insync thinks the order is already done
         ib_client.ib_cancel_order(trade.order)
+        log.debug("Sent cancel to IB for order id %s" % str(trade.order.orderId))
     except (Exception, asyncio.CancelledError) as e:
         log.warning(
-            "Couldn't send cancel for order id %s: %s" % (str(trade.order.orderId), str(e))
+            "Couldn't send cancel for order id %s: %s %s"
+            % (str(trade.order.orderId), type(e).__name__, str(e))
         )
+
+
+def _log_waiting_for_order_to_finish(
+    log, trade: ibTrade, what_ib_said: str, time_started: float
+):
+    # One line per reply from IB, so about one a second and at most a few dozen
+    log.debug(
+        "Waiting for order to finish, %.1f seconds since cancel: %s. %s"
+        % (time.monotonic() - time_started, what_ib_said, describe_ib_trade(trade))
+    )
+
+
+def describe_ib_trade(trade: ibTrade) -> str:
+    """
+    One line saying what we currently hold for an IB order. For logs only: never raises
+    """
+    try:
+        order_status = trade.orderStatus
+        if len(trade.log) > 0:
+            last_entry = _describe_ib_trade_log_entry(trade.log[-1])
+        else:
+            last_entry = "none"
+
+        return (
+            "order id %s, permid %s, status '%s', filled %s, remaining %s, last entry in history: %s"
+            % (
+                str(trade.order.orderId),
+                str(trade.order.permId),
+                str(order_status.status),
+                str(order_status.filled),
+                str(order_status.remaining),
+                last_entry,
+            )
+        )
+    except Exception as e:
+        return "(could not describe order: %s %s)" % (type(e).__name__, str(e))
+
+
+def describe_ib_trade_history(trade: ibTrade, max_entries: int = 25) -> str:
+    """
+    The status history ib_insync keeps for an order, most recent last.
+    An entry with a code was created from an error message rather than an order status.
+    For logs only: never raises
+    """
+    try:
+        all_entries = list(trade.log)
+        entries = all_entries[-max_entries:]
+        description = "; ".join(
+            [_describe_ib_trade_log_entry(entry) for entry in entries]
+        )
+        number_omitted = len(all_entries) - len(entries)
+        if number_omitted > 0:
+            description = "(%d earlier entries not shown) %s" % (
+                number_omitted,
+                description,
+            )
+        if len(entries) == 0:
+            description = "empty"
+
+        return description
+    except Exception as e:
+        return "(could not describe history: %s %s)" % (type(e).__name__, str(e))
+
+
+def _describe_ib_trade_log_entry(log_entry) -> str:
+    try:
+        entry_time = log_entry.time.strftime("%H:%M:%S.%f")[:-3]
+    except Exception:
+        entry_time = "time unknown"
+
+    description = "%s %s" % (entry_time, str(log_entry.status))
+    if log_entry.message:
+        description = "%s '%s'" % (description, str(log_entry.message))
+    if log_entry.errorCode:
+        description = "%s [code %s]" % (description, str(log_entry.errorCode))
+
+    return description
 
 
 def add_trade_info_to_broker_order(

@@ -258,7 +258,9 @@ def test_finished_trade_needs_no_cancel_and_no_query():
     assert confirm(ib_client, trade, log) is True
     assert ib_client.cancelled_orders == []
     assert ib_client.open_queries == 0
-    assert log.records == []
+    # one line saying why it counted as finished, and nothing alarming
+    assert len(log.records) == 1
+    assert "status 'Filled'" in log.messages("debug")[0]
 
 
 def test_phantom_cancel_is_really_cancelled_then_confirmed():
@@ -273,6 +275,16 @@ def test_phantom_cancel_is_really_cancelled_then_confirmed():
     assert ib_client.open_queries == 3
     assert len(log.messages("warning")) == 1
 
+    # enough in the log to reconstruct what happened afterwards
+    debug_log = "\n".join(log.messages("debug"))
+    assert "IB status history for order id 2184" in debug_log
+    assert "Order rejected - reason:Invalid Price' [code 201]" in debug_log
+    assert "Sent cancel to IB for order id 2184" in debug_log
+    assert "IB lists the order as open" in debug_log
+    assert "IB does not list the order as open (1 replies running, 2 needed)" in debug_log
+    assert "Order confirmed finished" in debug_log
+    assert "IB no longer lists it as open" in debug_log
+
 
 def test_order_that_never_goes_away_is_not_confirmed():
     trade = make_trade("Cancelled", PHANTOM_CANCEL_LOG)
@@ -282,6 +294,12 @@ def test_order_that_never_goes_away_is_not_confirmed():
     assert confirm(ib_client, trade, log) is False
     assert ib_client.cancelled_orders == [trade.order]
     assert ib_client.open_queries >= 1
+
+    # the failure says what IB last told us, and includes the history
+    failure_message = log.messages("warning")[-1]
+    assert "Order NOT confirmed finished" in failure_message
+    assert "IB lists the order as open" in failure_message
+    assert "[code 201]" in failure_message
 
 
 def test_one_reply_not_listing_the_order_is_not_enough():
@@ -304,6 +322,11 @@ def test_ib_not_answering_counts_as_still_open(no_answer):
     assert confirm(ib_client, trade, log) is False
     assert ib_client.cancelled_orders == [trade.order]
     assert ib_client.open_queries >= 1
+
+    failure_message = log.messages("warning")[-1]
+    assert "Order NOT confirmed finished" in failure_message
+    assert "no answer to open orders request" in failure_message
+    assert type(no_answer).__name__ in failure_message
 
 
 def test_no_answer_between_two_replies_resets_the_count():
@@ -372,7 +395,8 @@ def test_status_already_on_its_way_is_given_a_moment_to_arrive():
     assert confirm(ib_client, trade, log) is True
     assert ib_client.cancelled_orders == []
     assert ib_client.open_queries == 0
-    assert log.records == []
+    assert len(log.records) == 1
+    assert "after waiting" in log.messages("debug")[0]
 
 
 def test_failure_to_send_cancel_does_not_raise():
@@ -385,6 +409,40 @@ def test_failure_to_send_cancel_does_not_raise():
     log = FakeLog()
 
     assert confirm(ib_client, trade, log) is False
+    assert any(
+        "Couldn't send cancel for order id 2184: ConnectionError Not connected" in msg
+        for msg in log.messages("warning")
+    )
+
+
+def test_descriptions_for_the_log_never_raise():
+    from sysbrokers.IB.ib_orders import describe_ib_trade, describe_ib_trade_history
+
+    not_a_trade = object()
+    assert "could not describe" in describe_ib_trade(not_a_trade)
+    assert "could not describe" in describe_ib_trade_history(not_a_trade)
+
+    trade = make_trade("Submitted", [])
+    assert "last entry in history: none" in describe_ib_trade(trade)
+    assert describe_ib_trade_history(trade) == "empty"
+
+    # an entry whose time is missing, as ib_insync can produce before any message arrives
+    trade.log.append(TradeLogEntry(None, "Cancelled", "Error 201", 201))
+    assert "time unknown Cancelled 'Error 201' [code 201]" in describe_ib_trade(trade)
+
+
+def test_long_history_is_cut_down_to_the_most_recent_entries():
+    from sysbrokers.IB.ib_orders import describe_ib_trade_history
+
+    log_entries = [("Submitted", "Modify %d" % i, 0) for i in range(60)]
+    trade = make_trade("Submitted", log_entries)
+
+    description = describe_ib_trade_history(trade, max_entries=25)
+
+    assert description.startswith("(35 earlier entries not shown)")
+    assert "Modify 59" in description
+    assert "Modify 34'" not in description
+    assert "15:11:35.000 Submitted 'Modify 35'" in description
 
 
 def test_replay_of_incident_using_real_ib_insync_state_changes():
@@ -598,6 +656,12 @@ def test_exception_whilst_confirming_means_not_released_and_does_not_raise():
     assert handler.contract_stack.released == []
     assert len(handler.log.messages("critical")) == 1
     assert handler.fill_calls == [6811]
+
+    # the unexpected error is logged with enough to find it
+    warning = handler.log.messages("warning")[0]
+    assert "RuntimeError boom" in warning
+    assert "Traceback (most recent call last)" in warning
+    assert "confirm_order_is_finished_cancelling_if_required" in warning
 
 
 def test_failure_to_refresh_order_does_not_raise_or_block_release():

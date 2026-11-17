@@ -1,4 +1,5 @@
 import asyncio
+import traceback
 from copy import copy
 from syscore.objects import (
     resolve_function,
@@ -395,8 +396,8 @@ class stackHandlerCreateBrokerOrders(stackHandlerForFills):
             )
         except (Exception, asyncio.CancelledError) as e:
             self.log.warning(
-                "Problem confirming with broker that order is finished, assuming it is not: %s"
-                % str(e)
+                "Problem confirming with broker that order is finished, assuming it is not: %s %s\n%s"
+                % (type(e).__name__, str(e), traceback.format_exc())
             )
             is_finished = False
 
@@ -405,8 +406,8 @@ class stackHandlerCreateBrokerOrders(stackHandlerForFills):
             broker_order_with_controls.update_order()
         except (Exception, asyncio.CancelledError) as e:
             self.log.warning(
-                "Problem refreshing broker order after confirming it was finished: %s"
-                % str(e)
+                "Problem refreshing broker order after confirming it was finished: %s %s\n%s"
+                % (type(e).__name__, str(e), traceback.format_exc())
             )
 
         return is_finished is True
